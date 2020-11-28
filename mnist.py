@@ -7,34 +7,9 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import StepLR
 
 BATCH = 16
-NSAMPLES = 1
-SIGMA = 1.0
-
-class MNISTModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1,  6, 5),
-            nn.MaxPool2d(2, 2), # 6 24 24 -> 6 12 12
-            nn.ReLU(True),
-            nn.Conv2d(6, 16, 5), # 6 12 12 -> 16 8 8
-            nn.MaxPool2d(2, 2), # 16 8 8 -> 16 4 4
-            nn.ReLU(True)
-        )
-        self.classifier =  nn.Sequential(
-            nn.Linear(16 * 4 * 4, 120),
-            nn.ReLU(),
-            nn.Linear(120, 84),
-            nn.ReLU(),
-            nn.Linear(84, 10),
-            #nn.Softmax(1)
-        )
-
-    def forward(self, x):
-        x = self.encoder(x)
-        x = x.view(-1, 16 * 4 * 4)
-        x = self.classifier(x)
-        return x
+NSAMPLES = 1024
+SIGMA = 0.2
+BHALF = BATCH // 2
 
 class Net(nn.Module):
     def __init__(self):
@@ -58,7 +33,7 @@ class Net(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        return F.softmax(x, dim=1)
+        return x
 
 def load_data():
     transform = transforms.Compose([
@@ -81,16 +56,16 @@ def train(net, opt, dl_train, dev):
     for batch_idx, (data, target) in enumerate(dl_train):
         data = data.to(dev)
         target = target.to(dev)
-        zhat = target[:BATCH//2] + target[BATCH//2:]
+        zhat = target[:BHALF] + target[BHALF:]
         zhat = zhat.unsqueeze(0).repeat(NSAMPLES, 1).float()
         
-        probs = net(data)
-        d = dists.Categorical(probs=probs)
+        logits = net(data)
+        d = dists.Categorical(logits=logits)
         s = d.sample(sample_shape=(NSAMPLES,)) # NxBATCH
-        x,y = s[..., :BATCH//2], s[..., BATCH//2:]        
+        x,y = s[..., :BHALF], s[...,BHALF:]        
         z = x + y
         logp = d.log_prob(s)
-        logpx, logpy = logp[..., :BATCH//2], logp[..., BATCH//2:]
+        logpx, logpy = logp[..., :BHALF], logp[...,BHALF:]
 
         reward = torch.exp(-(z-zhat)**2/(2*SIGMA**2))
         loss = -(logpx + logpy)*reward.detach()
@@ -100,23 +75,46 @@ def train(net, opt, dl_train, dev):
         loss.backward()
         opt.step()
 
-        if batch_idx % 100 == 0:
+        if batch_idx % 20 == 0:
             print(loss.item(), reward.mean().item())
 
     return loss
 
 def test(net, dl_test, dev):
     net.eval()
+    N = 0
+    K = 0
     with torch.no_grad():
         for data, target in dl_test:
             data, target = data.to(dev), target.to(dev)
 
-            zhat = target[:BATCH//2] + target[BATCH//2:]
+            zhat = target[:BHALF] + target[BHALF:]
 
             probs = net(data)
             pred = probs.argmax(dim=1)
-            z = pred[:BATCH//2] + pred[BATCH//2:]
-            print(zhat, z)
+            z = pred[:BHALF] + pred[BHALF:]
+            N += BHALF
+            K += (zhat == z).sum().item()
+
+    return K/N
+
+def pretrain_net(net, opt, dl_train, dev):
+    net.train()
+    for batch_idx, (data, target) in enumerate(dl_train):
+        data = data.to(dev)
+        target = target.to(dev)
+
+        logits = net(data)
+        loss = F.cross_entropy(logits, target)
+        
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if batch_idx > 10:
+            break
+
+
 
 def main():
     dl_train, dl_test = load_data()
@@ -124,11 +122,13 @@ def main():
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     net = Net().to(dev)
-    opt = optim.Adam(net.parameters(), lr=1e-4)
+    opt = optim.SGD(net.parameters(), lr=1e-3, momentum=0.95)
+    pretrain_net(net, opt, dl_train, dev)
+    print('testing',test(net, dl_test, dev))
     #scheduler = StepLR(opt, step_size=1, gamma=0.7)
     for i in range(10):
         loss = train(net, opt, dl_train, dev)
-        test(net, dl_test, dev)
+        print('testing',test(net, dl_test, dev))
         #scheduler.step()
 
 if __name__ == '__main__':
